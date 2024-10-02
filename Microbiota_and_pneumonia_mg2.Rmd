@@ -1,0 +1,1295 @@
+---
+title: 'Microbiota and pneumonia, metagenome'
+author: "Anni Kauko"
+date: "`r Sys.Date()`"
+editor_options:
+  chunk_output_type: console
+  markdown:
+    wrap: sentence
+output:
+  html_document:
+    number_sections: true
+    code_folding: hide
+    toc: yes
+    toc_float:
+      collapsed: no
+      smooth_scroll: no
+    theme: flatly
+    highlight: haddock
+    df_print: paged
+  pdf_document:
+    toc: yes
+---
+
+```{r setup}
+figs <- "figs_mg/"
+data <- "data_mg"
+knitr::opts_chunk$set(echo = TRUE, message=FALSE, warning=FALSE)
+knitr::opts_chunk$set(fig.path=figs)
+
+#This script can be converted to md by following commands. md can be converted html by pandoc at local computer. (Atlas don't have pandoc)
+#R -e "knitr::knit('Microbiota_and_pneumonia_test2.Rmd')"
+#Move md-file and figure-directory to local computer with pandoc and run:
+#R -e "rmarkdown::render('Microbiota_and_pneumonia_mg2.md')"
+
+```
+
+This is the code used for 'Microbiota and Pneumonia' study. 
+
+Study has following steps:
+
+  * Set up
+  * Load and check data: run script gen_data.R and read in objects
+  * Association between Shannon diversity and pnemonia
+  * Association between butyrate-producing bacteria and pneumonia
+  * Associations between abundance of core Genera & core species and pneumonia
+  * Association between microbiota composition (beta diversity) and pneumonia
+  * Abundance-based risk score using regularized cox regression *Note: For now tested in training set!!*
+
+Outcome: **BL1ST_J10_PNEUMONIA**
+
+# Data
+
+<details><summary>**Libraries**</summary>
+
+
+```{r libraries}
+
+if (!require("BiocManager", quietly = TRUE))
+    install.packages("BiocManager")
+#BiocManager::install(version="3.17", ask=F, force=T)
+
+#Matti styled definition:
+packages <- c("data.table","knitr", "ggplot2",
+               "phyloseq", "microbiome","vegan","biomformat","mia",
+               "survival","survminer",
+               "cmprsk", "glmnet","DESeq2","RColorBrewer","cowplot","ggpubr","ggrepel",
+               "scales","kableExtra","tableone", "tidyverse","ANCOMBC")
+
+is.installed <- function(pkg) {
+  new.pkg <- pkg[!(pkg %in% installed.packages()[, "Package"])]
+  if (length(new.pkg)) {
+    BiocManager::install(new.pkg, ask=F)
+  }
+  sapply(pkg, require, character.only = TRUE)
+}
+is.installed(packages)
+
+options(digits=9) # increase number of digits
+
+#I was not able to install yingtools2 dependence due to outdated environment.
+#However some of their functions were usable.
+source("scripts/functions_yingtools2.R")
+source("scripts/functions.R")
+```
+
+</details><br>
+
+Variables
+```{r variables}
+# Outcome
+outcome <- "BL1ST_PNEUMONIA_HELIUS"
+outcome_short <- "Pneumonia"
+
+#covariates
+covs_nicenames <- 
+  c(BL_AGE            = "Age",                #Age at the time of sample collection
+    MEN               = "Men",                #Is person a men
+    BMI               = "BMI",
+    SMOKING           = "Smoking",            #Three levels: Current smoker: 2, ex-smoker: 1, never: 0 ; self defined
+    ALKI2_FR02        = "Alcohol",             #Alcohol usage     ##Confirm that is OK to use this!!
+    Q57X              = "Physical activity",  #Physical activity
+    BL_USE_RX_J01     = "Antibiotics",        #Prior antibiotics
+    PREVAL_DIAB       = "Diabetes",           #Prevalent diabetes
+    PREVAL_CVD        = "CVD",                #Prevalent CVD
+    PREVAL_CR_ANYCANC = "Cancer",             #Prevalent cancer
+    HYPERT_AHA        = "Hypertension",       #Hypertension at baseline
+    PREVAL_PULMONARY  = "Pulmonary",          #PREVAL_COPD == 1 | PREVAL_ASTHMA == 1; self defined
+    PREVAL_GASTRO     = "Gastrointestinal")   #PREVAL_LIVERDIS == 1 | PREVAL_IBD == 1 | PREVAL_K11_COELIAC ==1; self defined     
+covs_names <- names(covs_nicenames)
+covs_formula <- paste(covs_names, collapse = " + ")
+
+riskscore_file <- str_glue("{data}/risk_score_finrisk_pneumonia.tsv")
+```
+
+
+## Read data
+
+
+<br>
+**Run data generation**
+
+```{bash generate data, eval=F, class.source = 'fold-show'}
+Rscript scripts/gen_data_mg.R > data_mg/gen_data.log &
+```
+
+<br>
+**Read data in**
+
+```{r read data}
+
+P             <- readRDS(str_glue("{data}/pseq_species.Rds"))
+P.genus      <- readRDS(str_glue("{data}/pseq_genera.Rds"))
+
+df          <- readRDS(str_glue("{data}/df_final.Rds")) %>% 
+  #Set'time' and 'event to current outcome and convert event to numeric
+  mutate(time =  get(str_glue("{outcome}_AGEDIFF")),
+         event = as.numeric(as.character(get(outcome))))
+
+#Read in beta diversity
+beta <- readRDS(str_glue("{data}/beta_dist.Rds"))
+ord <- readRDS(str_glue("{data}/beta_ord.Rds"))
+
+#Transform microbiome data
+P.comp <- microbiome::transform(P, "compositional")
+
+
+```
+
+Create core set for Genera and Species with and without CLR transformation
+
+**Species level**
+
+```{r core_set_species}
+# Transform to compositional data and filter out rare taxa (prevalence >1% and within-sample relative abundance of >0.1%)
+core_taxa <- P %>%
+  microbiome::transform("compositional") %>%
+  core(detection = .1/100, prevalence = 1/100) %>%
+  taxa_names()
+
+#CLR transformation *before* pruning.
+P.clr <- microbiome::transform(P, "clr")
+
+#Prune both unconverted and converted data
+P.core <- phyloseq::prune_taxa(core_taxa, P) 
+P.core.clr <- phyloseq::prune_taxa(core_taxa, P.clr) 
+
+#Create vector that maps rownames to species names 
+species_name <- as.data.frame(tax_table(P.core)) %>%
+  rownames_to_column("name") %>% 
+  pull(name, Species)
+name_species <- setNames(names(species_name), species_name) #reverse order, both are needed.
+
+```
+
+
+**Genus level**
+
+```{r core_set_genus}
+# Transform to compositional data and filter out rare taxa (prevalence >1% and within-sample relative abundance of >0.1%)
+core_taxa.genus <- P.genus %>%
+  microbiome::transform("compositional") %>%
+  core(detection = .1/100, prevalence = 1/100) %>%
+  taxa_names()
+
+#CLR transformation *before* pruning.
+P.genus.clr <- microbiome::transform(P.genus, "clr")
+
+#Prune both unconverted and converted data
+P.core.genus <- phyloseq::prune_taxa(core_taxa.genus, P.genus) 
+P.core.genus.clr <- phyloseq::prune_taxa(core_taxa.genus, P.genus.clr) 
+
+#Create vector that maps rownames to Genus names 
+genus_name <- as.data.frame(tax_table(P.core.genus)) %>%
+  rownames_to_column("name") %>% 
+  pull(name, Genus)
+name_genus <- setNames(names(genus_name), genus_name) #reverse order, both are needed.
+
+```
+
+
+<br>
+**Summary: Phyloseq data**
+
+Species 
+```{r summary_species_level}
+P
+```
+
+Genera 
+```{r summary_genera_level}
+P.genus
+```
+
+Core species
+
+```{r summary_core_species}
+P.core
+```
+
+
+Core Genera
+
+```{r summary_core_genera}
+P.core.genus
+```
+
+
+<details><summary>**Summary: Final data**</summary>
+
+```{r final summary}
+df %>% mutate(event=as.factor(event)) %>% summary() 
+```
+</details>
+
+
+<details><summary>**Histograms**</summary> 
+
+```{r, hist}
+par(mfrow=c(2,2))
+
+hist(df$time)
+hist(df$BL_AGE)
+hist(df$BMI)
+hist(df$ALKI2_FR02)
+
+par(mfrow=c(1,1))
+```
+</details>
+
+<details><summary>**Core species**</summary>
+
+```{r core_species_all}
+tax_table(P.core) %>% as.data.table() %>% as.data.frame() %>% select(-Kingdom) %>% my.kable() 
+```
+
+</details>
+
+
+<details><summary>**Core genera**</summary>
+
+```{r core_genera_all}
+tax_table(P.core.genus) %>% as.data.table() %>% as.data.frame() %>% select(-Kingdom, -Species) %>% my.kable() 
+```
+
+</details><br>
+
+## Characteristics
+
+```{r characteristics}
+df.tmp <- df %>%
+  rename_at(all_of(names(covs_nicenames)), ~covs_nicenames[.]) %>% 
+  mutate_at("event", ~if_else(.==1, "Pneumonia", "No pneumonia")) %>% 
+  dplyr::rename(Pneumonia = event, Time=time) 
+
+myVars <- c("Time",   covs_nicenames[covs_names])
+catVars <- myVars[!myVars %in% c("Time", "Age", "BMI", "Alcohol", "Hypertension")]
+nonnormal <- c("Time", "Age", "BMI", "Alcohol", "Hypertension")
+
+char.all <- CreateTableOne(data=df.tmp, vars = myVars, factorVars = catVars) %>% 
+  print(dropEqual=F, printToggle=F, contDigits=1, nonnormal=nonnormal)
+char.strata <-  CreateTableOne(data=df.tmp, vars = myVars, factorVars = catVars, strata="Pneumonia") %>% 
+  print(dropEqual=F, printToggle=F, contDigits=1, nonnormal=nonnormal)
+char <- cbind(char.all, char.strata)
+char <- char[,c(1,3,2,4)]
+rownames(char) <- gsub(" = 1", "",rownames(char))
+#char
+
+rownames(char) <- gsub("   ", "&nbsp;&nbsp;&nbsp;",rownames(char))
+char %>% my.kable 
+
+```
+
+<br>
+
+**Barplots to visualise microbiota composition**
+
+
+```{r composition_bars, fig.width =10, eval=T}
+
+## Composition bar plots
+# Phylum level
+P.phy <- tax_glom(P.comp, "Phylum")
+
+composition_phy <- get.otu.melt(P.phy, filter.zero =F)  %>% 
+  #Clean names and group by cleaned names
+  mutate_at("Phylum",   ~str_replace(., "^([^_]+)_.*$", "\\1")) %>%
+  group_by(Phylum) %>%
+    summarise(sum = sum(pctseqs)) %>% 
+  ungroup() %>%
+  #Group small phyla
+  mutate(Phylum = as.factor(if_else(sum < 5, "Others", Phylum))) %>%
+  group_by(Phylum) %>%
+    summarise(sum = sum(sum)) %>% 
+  ungroup() %>%
+  mutate(Phylum = fct_reorder(as.factor(Phylum), sum, .desc=T)) %>% 
+  mutate(Phylum = fct_relevel(Phylum, "Others", after=Inf))
+#levels(composition_phy$Phylum)
+
+  
+phyla <- 
+  composition_phy %>%
+  ggplot(aes(x="", y=sum, fill=Phylum)) + 
+  geom_bar(stat="identity", position="fill") +
+  theme_bw(base_size=12)+
+  ylab("Mean relative abundance")+ 
+  scale_y_continuous(expand=c(0,0), labels = percent)+
+  theme(axis.title.x=element_blank(),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        axis.ticks.x=element_blank(),
+        legend.title = element_blank(),
+        legend.position = "right") +
+  ggtitle("Phylum") 
+
+# Family
+P.fam <- tax_glom(P.comp, "Family")
+
+composition <- get.otu.melt(P.fam, filter.zero =F) %>%
+  #Clean names and group by cleaned names
+  mutate_at("Family",   ~str_replace(., "^([^_]+)_.*$", "\\1")) %>% 
+  group_by(Family) %>%
+    summarise(sum = sum(pctseqs)) %>% 
+  ungroup() %>%
+  #Group small phyla
+  mutate(Family = as.factor(if_else(sum < 100, "Others", Family))) %>%
+  group_by(Family) %>%
+    summarise(sum = sum(sum)) %>% 
+  ungroup() %>%
+  mutate(Family = fct_reorder(as.factor(Family), sum, .desc=T)) %>% 
+  mutate(Family = fct_relevel(Family, "Others", after=Inf))
+#levels(composition$Family)
+  
+family <- composition %>%
+  ggplot(aes(x="", y=sum, fill=Family)) + 
+  geom_bar(stat="identity", position="fill") +
+  theme_bw(base_size=12)+
+  ylab("Mean relative abundance")+ 
+  scale_y_continuous(expand=c(0,0), labels = percent)+
+  theme(axis.title.x=element_blank(),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        axis.ticks.x=element_blank(),
+        legend.title = element_blank(),
+        legend.position = "right") +
+  ggtitle("Family") 
+
+plot_grid(phyla, family)
+
+ggsave(file = str_glue("{figs}{outcome_short}_composition.pdf"), width = 8, height = 5, units = "in")
+
+```
+
+
+# Shannon diversity
+
+<br>
+**Dot plot** showing distribution of Shannon diversity:
+
+```{r dotplot}
+dotplot_shannon <- df %>%
+  #ggplot(aes(x= "", y = Shannon, fill = tertiles)) +
+  ggplot(aes(x="", y = Shannon, fill = tertiles)) +
+  geom_jitter(color = "black", pch = 21, alpha =.85, size = 3, width = 0.2)+
+  geom_hline(linetype = 2, yintercept=max(df$Shannon[df$tertiles == "Intermediate diversity"])) + 
+  geom_hline(linetype = 2, yintercept=max(df$Shannon[df$tertiles == "Low diversity"])) + 
+  scale_y_continuous(limits=c(0,5.8), expand=c(0,0))+
+  scale_fill_manual(values=c( "#882255", "#DDCC77", '#44AA99')) +
+  theme_cowplot()+
+  xlab("")+
+  ylab("Shannon diversity")+
+  theme(legend.position = "none")
+
+ggsave(str_glue("{figs}{outcome_short}_dotplot_shannon.pdf"))  
+print(dotplot_shannon) 
+```
+
+<br>
+**Kaplan-Meier plot**
+
+We used the survminer package to plot the cumulative events per tertile of Shannon diversity
+
+```{r surv_shannon}
+fit <- survfit(as.formula(str_glue("Surv(time, event) ~ tertiles")), data=df)
+
+survp <- ggsurvplot(fit, 
+           fun = "event", 
+           axes.offset = F, 
+           censor = F,            
+           xlab = "Years since sample collection", 
+           ylab = "Cumulative Incidence", 
+           palette=c( "#882255", "#DDCC77", '#44AA99'))
+
+ggsave(file = str_glue("{figs}{outcome_short}_ggsurv_shannon.pdf"), survp$plot)  #added by AK
+print(survp)
+
+rm(fit, survp)
+```
+
+<br>
+**Unadjusted model:**
+
+```{r cox1_shannon}
+summary(coxph(as.formula(str_glue("Surv(time, event) ~ Shannon")),  data=df)) # as continuous variable
+summary(coxph(as.formula(str_glue("Surv(time, event) ~ tertiles")), data=df))# in tertiles
+table(df$tertiles, df$event)
+```
+
+<br>
+**Multivariate model:**
+
+```{r cox2_shannon}
+summary(coxph(as.formula(str_glue("Surv(time, event) ~ Shannon + {covs_formula}")), data=df))
+summary(coxph(as.formula(str_glue("Surv(time, event) ~ tertiles + {covs_formula}")), data=df))
+```
+
+
+# Butyrate-producers
+
+We quantified (at the script gen_data.R) the relative abundance of butyrate-producing bacteria by
+calculating the relative abundance of 17 bacteria that are known to be
+the most abundant drivers of butyrate production.  
+We performed a CLR-transformation to correct for the compositional nature of microbiome data. (At the script gen_data.R)
+
+<br>
+**Dot plot** 
+
+Shows the distribution of butyrate-producing bacteria in our cohort.
+
+```{r dotplot_butyrate}
+dotplot_butyrate <- df %>%
+  ggplot(aes(x= "", y = butyrate, fill = tertiles_butyrate)) +
+  geom_jitter(color = "black", pch = 21, alpha =.85, size = 3, width = 0.2)+
+  geom_hline(linetype = 2, yintercept=max(df$butyrate[df$tertiles_butyrate == "Intermediate butyrate"])) + 
+  geom_hline(linetype = 2, yintercept=max(df$butyrate[df$tertiles_butyrate == "Low butyrate"])) + 
+  scale_fill_manual(values=c( "#882255", "#DDCC77", '#44AA99')) +
+  theme_cowplot()+
+  xlab("")+
+  ylab("Butyrate-producing bacteria")+
+  theme(legend.position = "none")
+
+ggsave(file = str_glue("{figs}{outcome_short}_butyrate_dotplot.pdf"), width = 3, height = 5, units = "in") 
+print(dotplot_butyrate)
+```
+
+<br>
+**Kaplan-Meier**
+
+We used the survminer package to plot the cumulative events per tertile of butyrate-producers
+
+```{r butyrate_surv}
+fit <- survfit(Surv(time, event) ~ tertiles_butyrate_clr, data=df)
+survp_buty <- ggsurvplot(fit, data = df, 
+           fun = "event", 
+           axes.offset = F, 
+           censor = F,            
+           xlab = "Years since sample collection", 
+           ylab = "Cumulative Incidence", 
+           palette=c( "#882255", "#DDCC77", '#44AA99'))
+
+print(survp_buty)
+ggsave(str_glue("{figs}{outcome_short}_ggsurv_buty.pdf"), survp_buty$plot, width = 9, height = 5, units = "in") 
+
+rm(fit, survp_buty) 
+```
+
+<br>
+**Unadjusted model**
+
+```{r cox1_butyrate_clr}
+table(df$event, df$tertiles_butyrate_clr)
+summary(coxph(Surv(time, event) ~ butyrate.clr, data=df)) # as continuous variable
+summary(coxph(Surv(time, event) ~ tertiles_butyrate_clr, data=df)) # in tertiles
+
+```
+
+<br>
+**Multivariate model**
+
+```{r cox2_butyrate_clr}
+summary(coxph(as.formula(str_glue("Surv(time, event) ~ butyrate.clr + {covs_formula}")), data=df))
+summary(coxph(as.formula(str_glue("Surv(time, event) ~ tertiles_butyrate_clr + {covs_formula}")), data=df))
+```
+
+
+# Core Species
+
+## Cox models
+
+```{r format_cox_species}
+#Convert otu table to data frame  
+core_species.clr <- otu_table(P.core.clr) %>% t() %>%
+  as.data.frame() %>% 
+  rownames_to_column("Barcode") 
+
+df.cox <- df %>% left_join(core_species.clr, by="Barcode")
+
+#Function to process results: Deselect coefficient and and proper names
+my.cxs.table.sp <- function(cxs.neat) {
+  cxs.neat %>%
+    arrange(Coefficient) %>%
+    select(-Coefficient) %>%
+    mutate_at("Predictor", ~name_species[.]) 
+}
+
+```
+
+<br>
+**Unadjusted**
+
+```{r cox1_species}
+
+#Cox regression with previously defined function
+set.seed(42)
+cxs.core.m1 <- cox_wrapper(data = df.cox,
+                        predictors = names(core_species.clr[,-1]),
+                        covariates = c(),
+                        alpha_level = 0.05,  #P value cutoff
+                        status = "event",
+                        time_to_event = "time",
+                        normalize = F,
+                        test_ph_assumption = F)
+
+#cxs.core.m1$neat_results %>% my.cxs.table.sp %>% as.data.frame()
+cxs.core.m1$neat_results %>% my.cxs.table.sp %>% my.kable
+  
+```
+
+<details><summary>All results</summary>
+
+```{r cox1_all_results_species}
+cxs.core.m1$results %>% 
+  mutate_at("predictor", ~name_species[.]) %>%
+  my.kable() 
+```
+
+</details><br>
+
+**Multivariate adjusted**
+
+```{r cox2_species}
+#Cox regression with previously defined function
+set.seed(42)
+cxs.core.m2 <- cox_wrapper(data = df.cox,
+                        predictors = names(core_species.clr[,-1]),
+                        covariates = covs_names,
+                        alpha_level = 0.05,  #P value cutoff
+                        status = "event",
+                        time_to_event = "time",
+                        normalize = F,
+                        test_ph_assumption = F)
+
+#cxs.core.m2$neat_results %>% my.cxs.table.sp %>% as.data.frame()
+cxs.core.m2$neat_results %>% my.cxs.table.sp %>% my.kable
+```
+
+<details><summary>All results</summary>
+```{r cox2_all_results_species}
+cxs.core.m2$results  %>% 
+  mutate_at("predictor", ~name_species[.]) %>%
+  my.kable() 
+```
+</details><br>
+
+
+## DESeq2
+
+
+We used DESeq2 to identify differentially abundant species between participants with an infection (or infection related mortality) during follow-up and those without infection. We used a multivariate adjusted model.
+
+```{r run_deseq_species}
+#Run DESeq
+gm_mean <- function(x, na.rm=T){
+  exp(sum(log(x[x>0]), na.rm=na.rm)/length(x))
+}
+dsq <- phyloseq_to_deseq2(P.core, as.formula(str_glue("~ {covs_formula} +  {outcome} ")))
+geoMeans <- apply(counts(dsq), 1, gm_mean)
+dsq <- estimateSizeFactors(dsq, geoMeans=geoMeans)
+dsq <- DESeq(dsq, fitType="local")
+
+#Create results table
+deseq.all <- results(dsq, cooksCutoff=F, pAdjustMethod="BH") %>%
+  as.data.frame() %>%
+  rownames_to_column("Species") %>% 
+  mutate_at("Species", ~name_species[.]) %>%
+  select(Species, log2FoldChange, padj) %>%
+  arrange(log2FoldChange)
+
+```
+
+```{r deseq_plot_species, fig.width=7, fig.height=14}
+
+#Column for infections (Now we do not clean Species names and group by name - let us keep GreenGenes as it is)
+deseq <- deseq.all %>%
+  filter(padj<0.05) %>%
+  #mutate_at("Species",   ~str_replace(., "^([^_]+)_.*$", "\\1")) %>%
+  select(Species,log2FoldChange) %>%
+  #group_by(Species) %>%
+  # summarise_at(c("log2FoldChange"), sum, na.rm=T) %>%
+  mutate(group=ifelse(log2FoldChange < 0, "No Infection", "Infection")) 
+
+deseqplot <- ggplot(deseq, aes(x=reorder(Species, log2FoldChange), y=log2FoldChange, fill=group)) +
+  geom_bar(stat = "identity", color = "black") +
+  coord_flip() +
+  ylab("log 2-Fold change") +
+  xlab("") + 
+  theme_bw(base_size = 12) +
+  scale_fill_manual(values =  c("#9F514D","#4197CC")) +
+  theme(legend.position = "none")
+
+ggsave(file = str_glue("{figs}{outcome_short}_deseq_sp.pdf")) 
+print(deseqplot)
+# rm(gm_mean, geoMeans, dsq) # res
+```
+
+
+<details><summary>Results table</summary>
+
+```{r deseq_table_all_species}
+deseq.all %>% my.kable() 
+```
+
+</details><br>
+
+
+## ANCOM-BC
+
+Added ANCOM-BC as additional method to identify differentially abundant species between participants with an infection (or infection related mortality) during follow-up and those without infection. 
+
+<br>
+**Unadjusted**
+
+```{r ancom_species, fig.width=7, fig.height=14}
+
+out <- ancombc2(P.core,
+              fix_formula=outcome,
+              tax_level = "Species",
+              p_adj_method = "BH",
+              prv_cut = 0)
+
+ancom.all <- out$res %>%
+  mutate(lfc := get(str_glue("lfc_{outcome}1"))) %>%
+  mutate(q_event := get(str_glue("q_{outcome}1"))) 
+ancom <- ancom.all %>% 
+  filter(q_event < 0.05) %>%
+  dplyr::select(taxon, lfc, q_event) %>%
+  mutate(group = if_else(lfc < 0, "Infection", "No infection"))
+
+ancomplot <- ggplot(ancom, aes(x=reorder(taxon, lfc), y=lfc, fill=group)) +
+  geom_bar(stat = "identity", color = "black") +
+  coord_flip() +
+  ylab("Log fold change") +
+  xlab("") +
+  theme_bw(base_size = 12) +
+  scale_fill_manual(values = c("#4197CC","#9F514D")) +
+  theme(legend.position = "none")
+
+ggsave(file = str_glue("{figs}{outcome_short}_ancom_sp.pdf"))
+print(ancomplot)
+#rm(ancom)
+```
+
+
+<details><summary>Results table</summary>
+```{r ancom_results_species}
+ancom.all %>% my.kable() 
+```
+
+</details><br>
+
+**Adjusted**
+
+
+```{r ancom_adj_species}
+
+out.adj <- ancombc2(P.core,
+              fix_formula=str_glue("{outcome} + {covs_formula}"),
+              tax_level = "Species",
+              p_adj_method = "BH",
+              prv_cut = 0)
+
+ancom.adj.all <- out.adj$res %>%
+  mutate(lfc := get(str_glue("lfc_{outcome}1"))) %>%
+  mutate(q_event := get(str_glue("q_{outcome}1")))
+ancom.adj <- ancom.adj.all %>% 
+  filter(q_event < 0.05) %>%
+  dplyr::select(taxon, lfc, q_event) %>%
+  mutate(group = if_else(lfc < 0, "Infection", "No infection"))
+
+ancomplot.adj <- ggplot(ancom.adj, aes(x=reorder(taxon, lfc), y=lfc, fill=group)) +
+  geom_bar(stat = "identity", color = "black") +
+  coord_flip() +
+  ylab("Log fold change") +
+  xlab("") +
+  theme_bw(base_size = 12) +
+  scale_fill_manual(values = c("#4197CC","#9F514D")) +
+  theme(legend.position = "none")
+
+ggsave(file = str_glue("{figs}{outcome_short}_ancom_adj_sp.pdf"))
+print(ancomplot.adj)
+#rm(ancom)
+```
+
+
+<details><summary>Results table</summary>
+```{r ancom_all_species}
+ancom.adj.all %>% my.kable() 
+```
+
+</details><br>
+
+
+
+# Core genera
+
+## Cox models
+
+```{r format_cox_genera, eval=T}
+#Convert otu table to data frame and change to genus name  
+core_genera.clr <- otu_table(P.core.genus.clr) %>% t() %>%
+  as.data.frame() %>% 
+  rownames_to_column("Barcode")
+
+df.cox <- df %>% left_join(core_genera.clr, by="Barcode")
+
+#Function to process results: Deselect coefficient and proper names
+my.cxs.table.ge <- function(cxs.neat) {
+  cxs.neat %>%
+    arrange(Coefficient) %>%
+    select(-Coefficient) %>%
+    mutate_at("Predictor", ~name_genus[.]) 
+}
+```
+
+<br>
+**Unadjusted**
+
+```{r cox1_genera, eval=T}
+
+#Cox regression with previously defined function
+set.seed(42)
+cxs.core.m1 <- cox_wrapper(data = df.cox,
+                        predictors = names(core_genera.clr[,-1]),
+                        covariates = c(),
+                        alpha_level = 0.05,  #P value cutoff
+                        status = "event",
+                        time_to_event = "time",
+                        normalize = F,
+                        test_ph_assumption = F)
+
+#cxs.core.m1$neat_results %>% my.cxs.table.ge %>% as.data.frame()
+cxs.core.m1$neat_results %>% my.cxs.table.ge %>% my.kable
+  
+```
+
+<details><summary>All results</summary>
+
+```{r cox1_all_genera, eval=T}
+cxs.core.m1$results %>% 
+  mutate_at("predictor", ~name_genus[.]) %>%
+  my.kable() 
+```
+
+</details><br>
+
+**Multivariate adjusted**
+
+```{r cox2_genera, eval=T}
+#Cox regression with previously defined function
+set.seed(42)
+cxs.core.m2 <- cox_wrapper(data = df.cox,
+                        predictors = names(core_genera.clr[,-1]),
+                        covariates = covs_names,
+                        alpha_level = 0.05,  #P value cutoff
+                        status = "event",
+                        time_to_event = "time",
+                        normalize = F,
+                        test_ph_assumption = F)
+
+#cxs.core.m2$neat_results %>% my.cxs.table.ge %>% as.data.frame()
+cxs.core.m2$neat_results %>% my.cxs.table.ge %>% my.kable
+```
+
+<details><summary>All results</summary>
+```{r cox2_all_results_genera, eval=T}
+cxs.core.m2$results %>%
+  mutate_at("predictor", ~name_genus[.]) %>%
+  my.kable() 
+```
+</details><br>
+
+
+## DESeq2
+
+
+We used DESeq2 to identify differentially abundant genera between participants with an infection (or infection related mortality) during follow-up and those without infection. We used a multivariate adjusted model.
+
+```{r run_deseq_genera, eval=T}
+#Run DESeq
+gm_mean <- function(x, na.rm=T){
+  exp(sum(log(x[x>0]), na.rm=na.rm)/length(x))
+}
+dsq <- phyloseq_to_deseq2(P.core.genus, as.formula(str_glue("~ {covs_formula} +  {outcome} ")))
+geoMeans <- apply(counts(dsq), 1, gm_mean)
+dsq <- estimateSizeFactors(dsq, geoMeans=geoMeans)
+dsq <- DESeq(dsq, fitType="local")
+
+#Create results table
+deseq.all <- results(dsq, cooksCutoff=F, pAdjustMethod="BH") %>%
+  as.data.frame() %>%
+  rownames_to_column("Genus") %>% 
+  mutate_at("Genus", ~name_genus[.]) %>%
+  select(Genus, log2FoldChange, padj) %>%
+  arrange(log2FoldChange)
+
+```
+
+```{r deseq_plot_genera, fig.width=7, fig.height=14, eval=T}
+
+#Column for infections (Now we do not clean Genus names and group by name - let us keep GreenGenes as it is)
+deseq <- deseq.all %>%
+  filter(padj<0.05) %>%
+  #mutate_at("Genus",   ~str_replace(., "^([^_]+)_.*$", "\\1")) %>%
+  select(Genus,log2FoldChange) %>%
+  #group_by(Genus) %>%
+  # summarise_at(c("log2FoldChange"), sum, na.rm=T) %>%
+  mutate(group=ifelse(log2FoldChange < 0, "No Infection", "Infection")) 
+
+deseqplot <- ggplot(deseq, aes(x=reorder(Genus, log2FoldChange), y=log2FoldChange, fill=group)) +
+  geom_bar(stat = "identity", color = "black") +
+  coord_flip() +
+  ylab("log 2-Fold change") +
+  xlab("") + 
+  theme_bw(base_size = 12) +
+  scale_fill_manual(values =  c("#9F514D","#4197CC")) +
+  theme(legend.position = "none")
+
+ggsave(file = str_glue("{figs}{outcome_short}_deseq_ge.pdf")) 
+print(deseqplot)
+# rm(gm_mean, geoMeans, dsq) # res
+```
+
+
+<details><summary>Results table</summary>
+
+```{r deseq_table_all_genera, eval=T}
+deseq.all %>% my.kable() 
+```
+
+</details><br>
+
+
+## ANCOM-BC
+
+Added ANCOM-BC as additional method to identify differentially abundant genera between participants with an infection (or infection related mortality) during follow-up and those without infection. 
+
+<br>
+**Unadjusted**
+
+```{r ancom_genera, eval=T}
+
+out <- ancombc2(P.core.genus,
+              fix_formula=outcome,
+              tax_level = "Genus",
+              p_adj_method = "BH",
+              prv_cut = 0)
+
+ancom.all <- out$res %>%
+  mutate(lfc := get(str_glue("lfc_{outcome}1"))) %>%
+  mutate(q_event := get(str_glue("q_{outcome}1"))) 
+ancom <- ancom.all %>% 
+  filter(q_event < 0.05) %>%
+  dplyr::select(taxon, lfc, q_event) %>%
+  mutate(group = if_else(lfc < 0, "Infection", "No infection"))
+
+ancomplot <- ggplot(ancom, aes(x=reorder(taxon, lfc), y=lfc, fill=group)) +
+  geom_bar(stat = "identity", color = "black") +
+  coord_flip() +
+  ylab("Log fold change") +
+  xlab("") +
+  theme_bw(base_size = 12) +
+  scale_fill_manual(values = c("#4197CC","#9F514D")) +
+  theme(legend.position = "none")
+
+ggsave(file = str_glue("{figs}{outcome_short}_ancom_ge.pdf"))
+print(ancomplot)
+#rm(ancom)
+```
+
+
+<details><summary>Results table</summary>
+```{r ancom_results_genera, eval=T}
+ancom.all %>% my.kable() 
+```
+
+</details><br>
+
+**Adjusted**
+
+
+```{r ancom_adj_genera, eval=T}
+
+out.adj <- ancombc2(P.core,
+              fix_formula=str_glue("{outcome} + {covs_formula}"),
+              tax_level = "Genus",
+              p_adj_method = "BH",
+              prv_cut = 0)
+
+ancom.adj.all <- out.adj$res %>%
+  mutate(lfc := get(str_glue("lfc_{outcome}1"))) %>%
+  mutate(q_event := get(str_glue("q_{outcome}1")))
+ancom.adj <- ancom.adj.all %>% 
+  filter(q_event < 0.05) %>%
+  dplyr::select(taxon, lfc, q_event) %>%
+  mutate(group = if_else(lfc < 0, "Infection", "No infection"))
+
+ancomplot.adj <- ggplot(ancom.adj, aes(x=reorder(taxon, lfc), y=lfc, fill=group)) +
+  geom_bar(stat = "identity", color = "black") +
+  coord_flip() +
+  ylab("Log fold change") +
+  xlab("") +
+  theme_bw(base_size = 12) +
+  scale_fill_manual(values = c("#4197CC","#9F514D")) +
+  theme(legend.position = "none")
+
+ggsave(file = str_glue("{figs}{outcome_short}_ancom_adj_ge.pdf"))
+print(ancomplot.adj)
+#rm(ancom)
+```
+
+
+<details><summary>Results table</summary>
+```{r ancom_results_all_genera, eval=T}
+ancom.adj.all %>% my.kable() 
+```
+
+</details><br>
+
+
+# Beta diversity
+
+
+## Permutational analysis
+
+<br>
+**Unadjusted**
+
+```{r adonis, eval=T}
+set.seed(42)
+adonis2((as.formula(str_glue("beta ~ {outcome}"))), by = 'margin', data = df, permutations =999)
+```
+
+<br>
+**Multivariate adjusted**
+
+```{r adonis2, eval=T}
+set.seed(42)
+adonis2((as.formula(str_glue("beta ~ {outcome}  + {covs_formula}"))), by = 'margin', data = df, permutations =999)
+```
+
+
+## Cox model
+
+Join ordination to data frame
+
+```{r cox_reformat_beta, eval=T}
+ord10 <- ord$vectors[,1:10] %>% 
+  as.data.frame %>%
+  rownames_to_column("Barcode")
+df.beta <- df %>% left_join(ord10, by="Barcode")
+```
+
+<details><summary>Ordination details</summary>
+
+```{r ord_details, eval=T}
+ord$values %>% head(10) %>% my.kable() 
+```
+
+</details><br>
+
+
+**Unadjusted**
+
+```{r cox1_beta, eval=T}
+
+#Cox regression with previously defined function
+set.seed(42)
+cxs.ord.m1 <- cox_wrapper(data = df.beta,
+                        predictors = names(ord10[,-1]),
+                        covariates = c(),
+                        alpha_level = 0.05,  #P value cutoff
+                        status = "event",
+                        time_to_event = "time",
+                        normalize = F,
+                        test_ph_assumption = F)
+
+
+cxs.ord.m1$neat_results %>% select(Predictor, HR,`P (adjusted)`) %>% my.kable()
+
+```
+
+<details><summary>All results</summary>
+
+```{r cox1_beta_all, eval=T}
+cxs.ord.m1$results %>% my.kable() 
+```
+
+</details><br>
+
+**Multivariate adjusted**
+
+```{r cox2_beta, eval=T}
+#Cox regression with previously defined function
+set.seed(42)
+cxs.ord.m2 <- cox_wrapper(data = df.beta,
+                        predictors = names(ord10[,-1]),
+                        covariates = covs_names,
+                        alpha_level = 0.05,  #P value cutoff
+                        status = "event",
+                        time_to_event = "time",
+                        normalize = F,
+                        test_ph_assumption = F)
+
+cxs.ord.m2$neat_results %>% select(Predictor, HR,`P (adjusted)`) %>% my.kable()
+
+```
+<br>
+
+
+<details><summary>All results</summary>
+
+```{r cox2_beta_all, eval=T}
+cxs.ord.m2$results %>% my.kable() 
+```
+
+</details><br>
+
+## Centroids
+
+We created a figure showing the centroids of our two main groups and a figure coloured by the abundance of butyrate-producing bacteria. 
+
+```{r plot_beta, eval=T}
+
+# Create dataframe with coordinates and centroids of participants
+#beta_df <- df.beta %>% dplyr::select(Axis.2, Axis.4, Barcode, all_of(outcome)) 
+centroids <- aggregate(as.formula(str_glue("cbind(Axis.2, Axis.4)~ {outcome}")), data=df.beta, mean)
+df.beta <- merge(df.beta, centroids, by=outcome, suffixes=c("", ".centroid"))
+
+# Create separate dataframes for participants with/without the event
+df.beta.event <- df.beta %>%
+  filter(get(outcome) == "1") 
+df.beta.no <- df.beta %>%    
+  filter(get(outcome) == "0")
+
+betadots <- ggplot() +
+  geom_hline(yintercept = 0.0, linetype = "dashed", color = "grey36", size = 0.4) +
+  geom_vline(xintercept = 0.0, linetype = "dashed", color = "grey36", size = 0.4) +
+  geom_point(data = df.beta, aes(x=Axis.2, y=Axis.4), size = 1, colour = "grey36") +
+  geom_label_repel(data = centroids, aes(x=Axis.2, y=Axis.4, colour=.data[[outcome]], label=c("No event", "Event")), size=6, fill=ggplot2::alpha(c("white"),.76)) +
+  stat_ellipse(data = df.beta.event, aes(Axis.2, Axis.4,  colour=.data[[outcome]]), level = 0.95, lwd= 1.5) +
+  stat_ellipse(data = df.beta.no, aes(Axis.2, Axis.4,  colour=.data[[outcome]]), level = 0.95, lwd= 1.5) +
+  geom_point(data = centroids, aes(x=Axis.2, y=Axis.4,  colour=.data[[outcome]]), size = 5) +
+  theme_cowplot() +
+  scale_colour_manual(values=c("#4197CC", "#9F514D")) +
+  xlab("Axis2")+
+  ylab("Axis4")+
+  theme(legend.position = "none",
+        # axis.title = element_blank(),
+        axis.ticks = element_blank(),
+        axis.text = element_blank())
+print(betadots)
+ggsave(file = str_glue("{figs}{outcome_short}_beta.pdf"))  #added by AK
+
+
+# Colour by butyrate
+betabuty <- ggplot() + #midpoint: median(df.beta$butyrate)
+  geom_hline(yintercept = 0.0, linetype = "dashed", color = "grey36", size = 0.4) +
+  geom_vline(xintercept = 0.0, linetype = "dashed", color = "grey36", size = 0.4) +
+  geom_point(data = df.beta, aes(x=Axis.2, y=Axis.4, colour = butyrate), size = 1.5) +
+  stat_ellipse(data = df.beta.event, aes(Axis.2, Axis.4), level = 0.95, lwd= 1.5) +
+  stat_ellipse(data = df.beta.no, aes(Axis.2, Axis.4), level = 0.95, lwd= 1.5) +
+  geom_point(data = centroids, aes(x=Axis.2, y=Axis.4), size = 5) +
+  theme_cowplot() +
+  xlab("Axis2")+
+  ylab("Axis4")+
+  scale_colour_gradient2(low = "#821d4e", mid = "#DDCC77", high = "#1d8251", midpoint = median(df.beta$butyrate))+
+  theme(legend.position = "none",
+        # axis.title = element_blank(),
+        axis.ticks = element_blank(),
+        axis.text = element_blank())
+print(betabuty)
+ggsave(file = str_glue("{figs}{outcome_short}_betabuty.pdf"))  #added by AK
+
+
+rm(P.comp, beta, ord, deseq, centroids, df.beta, df.beta.event, df.beta.no)
+
+```
+
+
+
+# Risk score
+
+The signature of bacterial effect sizes (coefficient of each term in the model) was trained in the FINNRISK cohort using regularized regression. Positive values indicate increased risk of infection; negative values decreased risk. The risk score was subsequently calculated by multiplying the weights (defined by the regularized Cox model) with the relative abundances. 
+A full list of bacteria contributing to the risk score (including their weights) are printed to 'risk-score-finrisk-pneumonia.tsv'. 
+
+<br>
+**Calculate the risk score**
+
+```{r calculate_riskscore, eval=T}
+
+P.cox <- microbiome::transform(P.core, "compositional")
+tax <- get.tax(P.cox)
+#identical(colnames(otu_table(P.cox)), df$Barcode)  #check that names are identical
+
+# Define response and predictors variables
+response <- Surv(df$time, df$event) 
+predictors <- otu_table(P.cox) %>% t()
+predictors <- log(predictors+2e-05) # add a pseudo count to eliminate the possibility of –Infinity values
+
+
+# Calculate risk score
+set.seed(42)
+fit <- glmnet::cv.glmnet(predictors, response, 
+                         #alpha=c(0, .1, .25, .5, 1.0), 
+                         family="cox", 
+                         maxit=10000)
+#fit
+#plot(fit)
+
+riskscore <- as.data.frame(as.matrix(coef(fit, s=fit$lambda.1se))) %>%
+  rownames_to_column(var='otu') %>% 
+  mutate(weight = `1`) %>%
+  left_join(tax) %>%
+  dplyr::select(Phylum, Class, Order, Family, Genus, weight) %>%
+  mutate_at(c("weight"), ~(scale(.))) %>%
+  mutate(direction = if_else(weight > 0, "event", "no_event"))
+
+fwrite(riskscore, riskscore_file) # export the risk score to validate in FINRISK cohort
+
+```
+
+<br>
+**Visualizing the risk score:**
+
+```{r riskscore_visualisation, eval=T}
+
+scaled_riskscore <- get.otu.melt(P.cox, filter.zero = F) %>%
+  group_by(Phylum, Class, Order, Family, Genus) %>%
+  dplyr::summarize(meanabundance = mean(pctseqs)) %>%
+  left_join(riskscore) %>%
+  mutate(abundance_scaled_weight = meanabundance * abs(weight)) %>%
+  mutate(Genus = as.character(Genus)) %>%
+  mutate(label = if_else(abundance_scaled_weight>0.01, Genus, 
+                         if_else(abs(weight)>2, Genus, ""))) %>%
+  mutate(size = if_else(meanabundance > 0.05, "0.05", 
+                        if_else(meanabundance > 0.01, ">0.01", 
+                                if_else(meanabundance > 0.001, ">0.001", "<0.001"))))
+
+ggplot(scaled_riskscore, aes(x=weight, y=abundance_scaled_weight, colour=direction)) + 
+  geom_point(aes(size=size)) +
+  geom_text_repel(aes(label=label), min.segment.length=unit(0, "lines"), 
+                  nudge_x=0, nudge_y=0.2, segment.alpha=0.3, force=2) +
+  scale_y_continuous(trans=log_epsilon_trans(epsilon=.01)) +
+  scale_colour_manual(values = c("#9F514D", "#4197CC")) +
+  theme_cowplot() +
+  theme(legend.position = "none")
+
+ggsave(file = str_glue("{figs}{outcome_short}_scaled_riskscores.pdf"), width = 4, height = 5, units = "in")
+
+#rm(P.cox,  tax, response, predictors, fit, riskscore, scaled_riskscore)
+```
+
+<br>
+**Validate the risk score**
+
+Currently with the same cohort. Later should be changed to possible replication cohort.
+
+We first calculate the risk score for each individual: 
+
+```{r riskscore_validate, eval=T}
+
+riskscores <- fread(riskscore_file) # file to calculate the risk scores
+
+riskscore <- get.otu.melt(P)
+
+riskscore <- riskscore %>%
+  mutate(Genus = if_else(Genus == "", paste(Family, "bacterium", sep = " ", collapse = NULL), Genus)) %>%
+  filter(Genus != " bacterium") %>%
+  left_join(riskscores, by = "Genus") %>%  
+  filter(!is.na(weight)) %>% 
+  mutate(indiv_score = weight*pctseqs) %>% 
+  group_by(sample, .data[[outcome]]) %>%                               
+    summarize(indiv_score = sum(indiv_score)) %>% 
+    dplyr::rename(Barcode=sample)  %>%            #AK: df used sample_id
+    left_join(df) %>% 
+  ungroup() %>%     
+  mutate(tertiles_riskscore = ntile(indiv_score, 3)) %>%
+  mutate(tertiles_riskscore = as.factor(if_else(tertiles_riskscore == 1, 'Low risk score', if_else(tertiles_riskscore == 2, 'Intermediate risk score', 'High risk score')))) %>%
+  mutate(tertiles_riskscore = fct_relevel(tertiles_riskscore, "Low risk score", "Intermediate risk score", "High risk score")) 
+
+```
+
+<br>
+**Dot plot** showing distribution of risk scores:
+
+```{r riskscore_plot, eval=T}
+
+dotplot_riskscore <- riskscore %>%
+  ggplot(aes(x= "", y = indiv_score, fill = tertiles_riskscore)) +
+  geom_jitter(color = "black", pch = 21, alpha =.85, size = 3, width = 0.2)+
+  geom_hline(linetype = 2, yintercept=max(riskscore$indiv_score[riskscore$tertiles_riskscore == "Intermediate risk score"])) + 
+  geom_hline(linetype = 2, yintercept=max(riskscore$indiv_score[riskscore$tertiles_riskscore == "Low risk score"])) + 
+  scale_fill_manual(values=c("#44AA99", "#DDCC77","#882255")) +
+  theme_cowplot()+
+  xlab("")+
+  ylab("Risk score")+
+  theme(legend.position = "none")
+
+ggsave(file = str_glue("{figs}{outcome_short}_dotplot_riskscore.pdf"), width = 3, height = 4.5, units = "in")
+print(dotplot_riskscore)
+
+```
+
+<br>
+**Kaplan-Meier**
+
+Cumulative events per tertile of risk score
+
+```{r risk_surv, eval=T}
+riskscore.tmp <- riskscore %>% mutate(event = as.numeric(as.character(event)))
+fit <- survfit(Surv(time, event) ~ tertiles_riskscore, data=riskscore.tmp)
+survp_risk <- ggsurvplot(fit, data = riskscore.tmp, 
+           fun = "event", 
+           axes.offset = F, 
+           censor = F,            
+           xlab = "Years since sample collection", 
+           ylab = "Cumulative Incidence", 
+           palette=c( "#882255", "#DDCC77", '#44AA99'))
+
+print(survp_risk)
+ggsave(str_glue("{figs}{outcome_short}_ggsurv_risk.pdf"), survp_risk$plot, width = 9, height = 5, units = "in") 
+
+#rm(fit, survp_risk) 
+```
+
+<br>
+**Unadjusted model**
+
+```{r risckscore_cox, eval=T}
+summary(coxph(Surv(time, event) ~ indiv_score, data=riskscore, id=Barcode)) # as continuous variable
+summary(coxph(Surv(time, event) ~ tertiles_riskscore, data=riskscore, id=Barcode)) # in tertiles
+
+table(riskscore$tertiles_riskscore, riskscore$event)
+```
+
+<br>
+**Multivariate model**
+
+```{r riskscore_cox2, eval=T}
+summary(coxph(as.formula(str_glue("Surv(time, event) ~  indiv_score + {covs_formula}")), data=riskscore, id=Barcode))
+summary(coxph(as.formula(str_glue("Surv(time, event) ~  tertiles_riskscore + {covs_formula}")), data=riskscore, id=Barcode))
+```
+
+```{r riskscore_rm, eval=T}
+rm(riskscore)
+```
+
+
+<details><summary>**SessionInfo**</summary>
+
+```{r SessionInfo}
+sessionInfo()
+options(digits=7) # decreae number of digits to standard
+```
+
+</details><br>
