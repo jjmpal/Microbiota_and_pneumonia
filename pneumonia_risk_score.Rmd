@@ -1,0 +1,167 @@
+---
+title: 'Microbiota and pneumonia, metagenome'
+author: "Turku Hypertension Center"
+date: "`r Sys.Date()`"
+---
+
+```{r setup}
+figs <- "figs_mg/"
+data <- "data_mg"
+knitr::opts_chunk$set(echo = TRUE, message=FALSE, warning=FALSE)
+knitr::opts_chunk$set(fig.path=figs)
+options(digits=9) # increase number of digits
+```
+
+# Library
+
+```{r}
+library(dplyr)
+library(microbiome)
+library(survival)
+library(stringr)
+```
+
+
+# Data
+
+```{r}
+source("scripts/functions_yingtools2.R")
+source("scripts/functions.R")
+```
+
+</details>
+
+Variables
+
+```{r variables}
+outcome <- "BL1ST_PNEUMONIA_HELIUS"
+outcome_short <- "Pneumonia"
+```
+
+```{r}
+covs_nicenames <- 
+  c(BL_AGE            = "Age",                #Age at the time of sample collection
+    MEN               = "Men",                #Is person a men
+    BMI               = "BMI",
+    SMOKING           = "Smoking",            #Three levels: Current smoker: 2, ex-smoker: 1, never: 0 ; self defined
+    ALKI2_FR02        = "Alcohol",             #Alcohol usage     ##Confirm that is OK to use this!!
+    Q57X              = "Physical activity",  #Physical activity
+    BL_USE_RX_J01     = "Antibiotics",        #Prior antibiotics
+    PREVAL_DIAB       = "Diabetes",           #Prevalent diabetes
+    PREVAL_CVD        = "CVD",                #Prevalent CVD
+    PREVAL_CR_ANYCANC = "Cancer",             #Prevalent cancer
+    HYPERT_AHA        = "Hypertension",       #Hypertension at baseline
+    PREVAL_PULMONARY  = "Pulmonary",          #PREVAL_COPD == 1 | PREVAL_ASTHMA == 1; self defined
+    PREVAL_GASTRO     = "Gastrointestinal")   #PREVAL_LIVERDIS == 1 | PREVAL_IBD == 1 | PREVAL_K11_COELIAC ==1; self defined     
+covs_names <- names(covs_nicenames)
+covs_formula <- paste(covs_names, collapse = " + ")
+```
+
+## Read data
+
+```{r read data}
+P <- readRDS(stringr::str_glue("{data}/pseq_species.Rds"))
+```
+
+```{r core_set_species}
+core_taxa <- P %>%
+ microbiome::transform("compositional") %>%
+ core(detection = .1/100, prevalence = 1/100) %>%
+ taxa_names()
+
+P.core <- phyloseq::prune_taxa(core_taxa, P) 
+
+species_name <- as.data.frame(tax_table(P.core)) %>%
+  tibble::rownames_to_column("name") %>% 
+  dplyr::pull(name, Species)
+
+name_species <- setNames(names(species_name), species_name) #reverse order, both are needed.
+```
+
+
+
+# Risk score
+
+```{r calculate_riskscore}
+P.cox <- microbiome::transform(P.core, "clr")
+df_cox <- merge(meta(P.cox), otu_table(P.cox) %>% t, by = 0, all = TRUE) %>%
+  mutate(time = get(stringr::str_glue("{outcome}_AGEDIFF")),
+         event = as.numeric(as.character(get(outcome))))
+c_partition <- caret::createDataPartition(y = df_cox$event, p = 0.5, list = FALSE)
+df_train <- df_cox[c_partition, ]
+df_test <- df_cox[-c_partition, ]
+```
+
+```{r}
+response <- survival::Surv(df_train$time, df_train$event)
+predictors <- df_train %>%
+  dplyr::select(one_of(species_name)) %>%
+  as.matrix
+```
+
+```{r}                                        
+set.seed(42)
+fit <- glmnet::cv.glmnet(predictors,
+                         response, 
+                         family = "cox", 
+                         maxit = 10000)
+```
+
+```{r}
+plot(fit)
+```
+
+
+```{r}
+get_features <- function(cvfit, s= "lambda.min") {
+  coef(cvfit, s = s) %>%
+    as.matrix() %>%
+    `colnames<-`("coef") %>%
+    as_tibble(rownames = "feature") %>%
+      dplyr::filter(abs(coef) > 1e-10)
+}
+```
+
+```{r}
+get_risk_score_formula <- function(cvfit, s="lambda.min") {
+  get_features(cvfit, s = s) %>%
+    dplyr::mutate(coef = round(1000*coef)) %>% 
+    dplyr::mutate(term = glue::glue("({coef} * {feature})")) %>%
+    dplyr::pull(term) %>%
+    stringr::str_c(collapse = "+")
+}
+```
+
+
+```{r}
+get_risk_score_formula(fit)
+```
+
+```{r}
+get_features(fit) %>%
+  dplyr::mutate(name = name_species[feature]) %>%
+  dplyr::arrange(desc(coef)) %>%
+  knitr::kable()
+```
+
+
+## Valida risk score
+
+```{r}
+df_train %>%
+  dplyr::mutate(risk = eval(parse(text=get_risk_score_formula(fit)))) %>% 
+  coxph(as.formula(str_glue("Surv(time, event) ~ risk + {covs_formula}")), data = .) %>%
+  broom::tidy(conf.int = TRUE) %>%
+  knitr::kable()
+```
+
+
+```{r}
+df_test %>%
+  dplyr::mutate(risk = eval(parse(text=get_risk_score_formula(fit)))) %>% 
+  coxph(as.formula(str_glue("Surv(time, event) ~ risk + {covs_formula}")), data = .) %>%
+  broom::tidy(conf.int = TRUE) %>%
+  knitr::kable()
+```
+
+
